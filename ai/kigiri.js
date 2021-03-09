@@ -1,52 +1,24 @@
 const SIZE = 100
 const MAX = SIZE * SIZE
-
-/// WEBWORKER BOOTSTRAP CODE
-addEventListener('message', self.init = initEvent => {
-  const { seed, id } = JSON.parse(initEvent.data)
-  const isOwnPlayer = p => p.name === id
-  const MAP = new Uint8Array(MAX)
-  const addToMap = ({ x, y }) => MAP[x * SIZE + y] = 1
-  const isFree = ({ x, y }) => MAP[x * SIZE + y] === 0
-  const isOccupied = ({ x, y }) => MAP[x * SIZE + y] === 1
-
-  let _seed = seed // Use seeded random for replayable games
-  const _m = 0x80000000
-  Math.random = () => (_seed = (1103515245 * _seed + 12345) % _m) / (_m - 1)
-  const toLog = []
-  const logEach = () => {
-    for (const l of toLog) { console.log(...l) }
-    toLog.length = 0
-  }
-  let t
-  console.timeout = id === 'kigiri'
-    ? (...a) => (toLog.push(a), clearTimeout(t), t = setTimeout(logEach, 100))
-    : () => {}
-  removeEventListener('message', self.init)
-  addEventListener('message', ({ data }) => {
-    toLog.length = 0
-    const players = JSON.parse(data)
-    const player = players.find(isOwnPlayer)
-    players.forEach(addToMap)
-
-    postMessage(JSON.stringify(update({ MAP, isFree, isOccupied, players, player })))
-  })
-  postMessage('loaded')
-})
+const MAP = new Uint8Array(MAX)
+const [FREE, OCCUPIED, FILLER, PREDICTION] = MAP.keys()
 
 /// AI CODE
 const inBounds = n => n < SIZE && n >= 0
 const isInBounds = ({ x, y }) => inBounds(x) && inBounds(y)
-const pickRandom = arr => arr[Math.floor(Math.random() * arr.length)]
+const addToMap = ({ x, y }) => MAP[x * SIZE + y] = OCCUPIED
+const isFree = ({ x, y }) => MAP[x * SIZE + y] === FREE
+const isOccupied = ({ x, y }) => MAP[x * SIZE + y] === OCCUPIED
 
 const pref = [ 1, 2, 0, -1 ]
-const genCountMap = (MAP, playerCoords, otherPlayersCoords) => {
-  let i, areaIndex
-  i = -1
+const calcArea = (mask = new Set) => {
   const scoreMap = new Uint16Array(MAX)
   const areas = new Map()
+
+  let i = -1
+  let areaIndex
   while (++i < MAX) {
-    if (MAP[i]) {
+    if (MAP[i] || mask.has(i)) {
       areaIndex = undefined
       continue
     }
@@ -77,88 +49,149 @@ const genCountMap = (MAP, playerCoords, otherPlayersCoords) => {
       areaIndex = undefined
     }
   }
-  const playerAreas = new Set
-  for (const coord of playerCoords) {
-    const area = areas.get(scoreMap[coord.index])
-    if (!area) continue
-    area.keep = true
-    coord.score = area.total
-    coord.areaIndex = area.i
-    playerAreas.add(area)
+  return { scoreMap, areas }
+}
+
+const NO_AREA = { i: -1, total: 0 }
+const nexter = [
+  ({ x, y }) => ({ x, y: y - 1 }),
+  ({ x, y }) => ({ x: x + 1, y }),
+  ({ x, y }) => ({ x, y: y + 1 }),
+  ({ x, y }) => ({ x: x - 1, y }),
+]
+const guessNext = coord => nexter[coord.cardinal](coord)
+const addCoordToSet = (set, coord) => set.add(coord.index)
+const addGuessToSet = (set, coord) => set
+  .add(coord.index)
+  .add(toIndex(guessNext(coord)))
+
+const genCountMap = (aiCoords, otherAIsCoords) => {
+  const { scoreMap, areas } = calcArea()
+
+  // Flag AIs area
+  for (const coord of aiCoords) {
+    (areas.get(scoreMap[coord.index]) || NO_AREA).keep = true
   }
 
   // Fill the empty spots so they are ignored later on
-  i = -1
+  let i = -1
   while (++i < MAX) {
     if (MAP[i]) continue
     const area = areas.get(scoreMap[i])
-    area && !area.keep && (MAP[i] = 2)
+    area && !area.keep && (MAP[i] = FILLER)
   }
 
-  for (const coord of otherPlayersCoords) {
-    const area = areas.get(scoreMap[coord.index])
-    if (!area) continue
+  const planA = calcArea(otherAIsCoords.reduce(addCoordToSet, new Set))
+  const planB = calcArea(otherAIsCoords.reduce(addGuessToSet, new Set))
+
+  // set ai areas
+  const aiAreas = new Set
+  for (const coord of aiCoords) {
+    const area = areas.get(scoreMap[coord.index]) || NO_AREA
+    const planATotal = (planA.areas.get(planA.scoreMap[coord.index]) || NO_AREA).total
+    const planBTotal = (planB.areas.get(planB.scoreMap[coord.index]) || NO_AREA).total
+    coord.score = area.total + (planATotal * 3) + planBTotal // test for rate
     coord.areaIndex = area.i
+    aiAreas.add(area)
   }
-  return [ ...playerAreas ]
+
+  for (const coord of otherAIsCoords) {
+    coord.areaIndex = (areas.get(scoreMap[coord.index]) || NO_AREA).i
+  }
+
+  return [ ...aiAreas ]
 }
 
 const flatten = (a, b) => a.concat(b)
 const toIndex = ({ x, y }) => x * SIZE + y
-const getPossibleMovesFrom = ({ x, y }, MAP) => [
+const getPossibleMovesFrom = ({ x, y }) => [
   { x, y: y + 1 },
   { x, y: y - 1 },
   { x: x + 1, y },
   { x: x - 1, y },
-].filter(isInBounds).map(toIndex).filter(index => MAP[index] === 0)
+].filter(isInBounds).filter(isFree)
 const addIndex = p => p.index = toIndex(p)
-const update = ({ isFree, players, player, MAP }) => {
-  const possibleCoords = player.coords
+const byDist = (a, b) => b.dist - a.dist
+const dist = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y)
+const update = ({ ais, ai }) => {
+  ais.forEach(addToMap)
+  const possibleCoords = ai.coords
     .filter(isInBounds)
     .filter(isFree)
 
-  const otherPlayers = players.filter(p => p.name !== player.name)
-  const otherPlayersCoords = otherPlayers
+  const otherAIs = ais.filter(p => p !== ai)
+  const otherAIsCoords = otherAIs
     .map(p => p.coords)
     .reduce(flatten, [])
     .filter(isInBounds)
     .filter(isFree)
 
-  players.forEach(addIndex)
+  ais.forEach(addIndex)
   possibleCoords.forEach(addIndex)
-  otherPlayersCoords.forEach(addIndex)
+  otherAIsCoords.forEach(addIndex)
 
-  const playerAreas = genCountMap(MAP, possibleCoords, otherPlayersCoords)
-  const playerAreasIndex = playerAreas.map(pa => pa.i)
-  const playerAreasValues = playerAreas.map(pa => pa.total)
-  const maxValue = playerAreasValues.reduce((a, b) => Math.max(a, b), 0)
-
+  const aiAreas = genCountMap(possibleCoords, otherAIsCoords)
+  const aiAreasIndex = aiAreas.map(pa => pa.i)
+  const maxValue = possibleCoords.reduce((a, b) => ({ score: Math.max(a.score, b.score) }), { score: 0 }).score
   possibleCoords.forEach(coord => coord.ratio = coord.score / maxValue)
 
-  const otherPlayersInSameArea = otherPlayers
-    .filter(p => p.coords.some(c => playerAreasIndex.includes(c.areaIndex)))
+  const otherAIsInSameArea = otherAIs
+    .filter(p => p.coords.some(c => aiAreasIndex.includes(c.areaIndex)))
+
+  otherAIsInSameArea
+    .map(p => p.dist = dist(p, ai))
+    .sort(byDist)
+
+  const nearestAI = otherAIsInSameArea[0] || ai
+  const farthestAI = otherAIsInSameArea[otherAIsInSameArea.length - 1] || ai
+  // console.timeout('ai in area count', otherAIsInSameArea.length)
+  // console.timeout('nearestAI', nearestAI.name, nearestAI.dist)
+  possibleCoords.forEach(coord =>
+    coord.nearestDist = dist(nearestAI, coord))
+
+  // console.timeout({ maxValue })
+  // console.timeout(possibleCoords)
 
   possibleCoords.sort((a, b) =>
-    (b.score - a.score) || (pref[b.direction] - pref[a.direction]))
+    (b.score - a.score)
+      || a.nearestDist - b.nearestDist
+      || (pref[b.direction] - pref[a.direction]))
 
-  if (!otherPlayersInSameArea.length) return possibleCoords[0]
+  if (!otherAIsInSameArea.length) return possibleCoords[0]
 
   // remove shitty moves (ratio lower than .33)
   const suckLessCoords = possibleCoords
     .filter(coord => coord.ratio > 0.33)
 
-  // A position is risky if another player can move on it next turn
-  const otherPlayersCoordsIndex = otherPlayersCoords.map(toIndex)
+  // A position is risky if another ai can move on it next turn
+  const otherAIsCoordsIndex = otherAIsCoords.map(toIndex)
   const unsafe = suckLessCoords
-    .filter(coord => !otherPlayersCoordsIndex.includes(coord.index))
+    .filter(coord => !otherAIsCoordsIndex.includes(coord.index))
+
+  // TODO: aggressive mode
+  // - Find nearest ai
+  // - Rush toward him
+
+  // TODO: passive mode
+  // - Find nearest ai
+  // - Avoid him
 
   // TODO: better check for "safe" spots:
   // - Check for tunnels
   // - find the end of the tunnel
-  // - find if a player can fill the gap before I can get out
+  // - find if a ai can fill the gap before I can get out
+
+  // TODO: better fill (if lone survivor)
+  // - Check if move will block empty space
+  // - fill space without being blocked
+
+  // TODO: win condition
+  // - Check if we can isolate a majority or blocks
+  // - Then just do that and fill
+
   const safe = unsafe
-    .filter(coord => getPossibleMovesFrom(coord, MAP)
-      .filter(coord => toIndex(coord) !== player.index).length > 1)
+    .filter(coord => getPossibleMovesFrom(coord)
+      .filter(coord => toIndex(coord) !== ai.index).length > 1)
 
   return safe[0] || unsafe[0] || possibleCoords[0]
 }
